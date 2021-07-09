@@ -1,4 +1,4 @@
-MRIPulse.jl - Design radiofrequency pulses for MRI
+MRIPulse.jl - Design radio-frequency pulses for MRI
 ==================================================
 
 **Work in progress, not ready for headache free usage**
