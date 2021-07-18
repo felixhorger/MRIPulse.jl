@@ -69,7 +69,7 @@ module MRIPulse
 	end
 
 	# Use these for plots only
-	@inline function time_axis(len::Integer, δt::R)::StepRangeLen{R} where R
+	@inline function time_axis(len::Integer, δt::R)::StepRangeLen{R} where R <: Real
 		@assert δt > 0.0
 		δt .* index_axis(len)
 	end
