@@ -11,6 +11,7 @@ module MRIPulse
 	export gaussian, sinc
 	export index_axis, time_axis, frequency_axis, frequency_unit
 	export frequency_shift, frequency_shift!
+	export rfspoiling
 	export multi_band_pulse, multi_band_pulse!
 	export power_integral, peak_power, amplitude_integral
 	export minimise_peak_power, grid_evaluate_peak_power
@@ -40,7 +41,7 @@ module MRIPulse
 		)
 	end
 
-	macro parallelise(threading, forloop)
+	macro parallelise(threading, forloop) # TODO
 		esc(
 			quote
 				if threading
@@ -53,7 +54,7 @@ module MRIPulse
 	end
 
 
-	# Pulse functions
+	# Pulse shapes
 	@inline function gaussian(t::Real, width::Real)::Real
 		exp(-(0.5 / width^2) * t^2)
 	end
@@ -126,6 +127,14 @@ module MRIPulse
 	end
 	@inline function frequency_shift(pulse::AbstractArray{T} where T <: Number, Δω::Real)
 		frequency_shift!(pulse, Δω, Array{ComplexF64}(undef, length(pulse)))
+	end
+
+	# RF spoiling
+	function rfspoiling(num::Integer, ϕ0::Real)::Vector{Float64}
+		n = 1:num
+		ϕ = @. (0.5 * ϕ0) * ( (n - 1) * (n - 2) )
+		# Note: At some point it makes sense to compute this differently,
+		# since floating point precision decreases.
 	end
 
 	# Multi band pulses
