@@ -1,5 +1,4 @@
 
-
 module MRIPulse
 	#=
 		Units philosophy: Use indices in time and frequency domain.
@@ -12,9 +11,10 @@ module MRIPulse
 	export index_axis, time_axis, frequency_axis, frequency_unit
 	export frequency_shift, frequency_shift!
 	export rfspoiling
+	export adiabatic_hyperbolic_secant
 	export multi_band_pulse, multi_band_pulse!
 	export power_integral, peak_power, amplitude_integral
-	export minimise_peak_power, grid_evaluate_peak_power
+	export minimise_peak_power, grid_evaluate_peak_power # Check with Samy's code (Bioeng KCL)
 
 	import Base: @view, sinc
 	import Random
@@ -23,7 +23,7 @@ module MRIPulse
 
 
 	# Macros
-	macro view(x, part)
+	macro view(x, part) # TODO: Extract from here
 		if part == :real
 			start = :1	
 		elseif part == :imag
@@ -55,7 +55,7 @@ module MRIPulse
 
 
 	# Pulse shapes
-	@inline function gaussian(t::Real, width::Real)::Real
+	@inline function gaussian(t::Real, width::Real)::Real # TODO: document what the actual width is
 		exp(-(0.5 / width^2) * t^2)
 	end
 
@@ -135,6 +135,134 @@ module MRIPulse
 		ϕ = @. (0.5 * ϕ0) * ( (n - 1) * (n - 2) )
 		# Note: At some point it makes sense to compute this differently,
 		# since floating point precision decreases.
+	end
+	
+	# Adiabatic pulses
+	macro log_2_sqrt_3()
+		log(2 + sqrt(3))
+	end
+	function adiabatic_hyperbolic_secant(
+		t::AbstractVector{<: Real},
+		ω1::Real,
+		width::Real,
+		μ::Real
+	)::Tuple{Vector{<: Complex}, Vector{<: Real}}
+		#=
+			ω1(t) = ω1(0) * sech(βt)
+			Δω0(t) = γB0 - Ω1
+			where Ω1 is the frequency of the B1 field
+			Explain effective field
+
+			Satisfy ellipsoid equation, radii are maximum amplitudes
+			1 = sqrt(  ( ω1(t) / ω1(0) )^2 + ( Δω0(t) / Δω0(-∞) )^2  )
+
+			Solve, setting -μβ = Δω0(t0)
+			Δω0(t)	= -μβ * sqrt(1 - ( ω1(t) / ω1(0) )^2 )
+					= -μβ * sqrt(1 - sech^2(βt))
+					= -μβ * sqrt( (cosh^2(βt) - 1) / cosh^2(βt) )
+					= -μβ * sqrt( sinh^2(βt) / cosh^2(βt) )
+					= -μβ * tanh(βt) # Silently ignoring the ±
+
+			The phase is then given by
+			ϕ(t)	= ∫ Δω0(t') dt' from a given t0 to t
+					= -μβ * ∫ tanh(βt') dt' from t0 to t
+					= -μ * ∫ tanh(τ) dτ' from βt0 to βt, using τ = βt'
+					= -μ * log(cosh(τ)) evaluated at βt0 and βt
+					= -μ * ( log(cosh(βt)) - log(cosh(βt0)) )
+					= -μ * log(cosh(βt) / cosh(βt0))
+
+
+			Full width half maximum of the ω1(t) curve
+
+			1/2 = 1 / cosh(βt)
+			2 = cosh(βt)
+			4 = exp(βt) + exp(-βt)
+			exp^2(βt) + 1 - 4 exp(βt) = 0
+			exp(βt) = (
+				4 ± sqrt(16 - 4 * 1 * 1)
+				/ 2
+			)
+			= 2 ± sqrt(3)
+
+			=> t = 1/β * log(2 ± sqrt(3))
+			=> width = 2/β * log(2 + sqrt(3))
+			=> β = 2/width * log(2 + sqrt(3))
+
+			Note that lim_{t → ∞} sech(βt) = 2*exp(-βt) can be used to determine a suitable width
+
+
+			Adiabaticity
+
+			K = |γB_eff / dα/dt|
+			= (
+				sqrt( ω1^2 * sech^2(βt) + (μβ)^2 * tanh^2(βt))
+				/ d/dt arctan(
+					ω1 * sech(βt)
+					/ (μβ * tanh(βt))
+				)
+			)
+			= (
+				sqrt( ω1^2 + (μβ)^2 * sinh^2(βt)) / cosh(βt)
+				/ d/dt arctan(
+					ω1
+					/ (μβ * sinh(βt))
+				)
+			)
+			= (
+				sqrt( ω1^2 + (μβ)^2 * sinh^2(βt)) / cosh(βt)
+				*
+				(1 + (ω1 / μβ)^2 csch^2(βt)) 
+				/
+				(ω1 / μ * cosh(βt)/sinh^2(βt))
+			)
+			= (
+				sqrt( ω1^2 + (μβ)^2 * sinh^2(βt))
+				*
+				(tanh^2(βt) + (ω1 / μβ)^2 sech^2(βt)) 
+				/
+				(ω1 / μ)
+			)
+			= (
+				sqrt(1 + (μβ / ω1)^2 * sinh^2(βt))
+				*
+				(tanh^2(βt) + (ω1 / μβ)^2 sech^2(βt)) 
+				* μ
+			)
+		=#
+		# Compute more convenient widht parameter
+		β = 2 / width * @log_2_sqrt_3
+
+		# Construct pulse and compute adiabaticity
+		pulse = Vector{ComplexF64}(undef, length(t));
+		K = Vector{Float64}(undef, length(t));
+		let cosh_βt = cosh.(β * t)
+
+			# Pulse
+			sech_βt = 1 ./ cosh_βt
+			@. pulse = ω1 * sech_βt * exp(-im * μ * log(cosh_βt / cosh(β * t[1])))
+
+			# Adiabaticity
+			let η = (μ * β / ω1)^2, tanh_βt = tanh.(β * t)
+				@. K = (
+					μ * sqrt(1 + η * (cosh_βt^2 - 1))
+					* (tanh_βt^2 + 1/η * sech_βt^2) 
+				)
+			end
+		end
+
+		return pulse, K
+	end
+
+	function adiabaticity(ω1::AbstractVector{<: Real}, Δω0::AbstractVector{<: Real})::Real
+		# ω1 = amplitude of B1, Δω0 = offset of B1 rotation to Larmor
+		# In units of dt
+		tmp = 0
+		dα_dt = Vector{Float64}(undef, length(ω1))
+		for t = 1:length(ω1)
+			dα_dt[t] = arctan(ω1[t] / Δω0[t]) - tmp
+			tmp = dα_dt[t]
+		end
+		A = @. sqrt(ω1^2 + Δω0^2) / abs.(dα_dt)
 	end
 
 	# Multi band pulses
