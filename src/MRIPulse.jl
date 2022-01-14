@@ -63,6 +63,15 @@ module MRIPulse
 		sinc((0.5 / width) * t)
 	end
 
+	@inline function rectangular(samples::Integer)::Vector{Float64}
+		# Convenience for creating a rectangular pulse that is not breaking the normalise! function
+		pulse = Vector{Float64}(undef, samples+2)
+		pulse[1] = 0
+		pulse[2:end-1] .= 1
+		pulse[end] = 0
+		return pulse
+	end
+
 	# Time and frequency (circular frequency, i.e. in radians) domain Axes
 	@inline function index_axis(len::Integer)::UnitRange{Int64}
 		@assert len > 0
@@ -148,13 +157,14 @@ module MRIPulse
 		μ::Real
 	)::Tuple{Vector{<: Complex}, Vector{<: Real}}
 		#=
+			TODO: remove t from args, rather set pulse length T and number samples
 			ω1(t) = ω1(0) * sech(βt)
 			Δω0(t) = γB0 - Ω1
 			where Ω1 is the frequency of the B1 field
 			Explain effective field
 
 			Satisfy ellipsoid equation, radii are maximum amplitudes
-			1 = sqrt(  ( ω1(t) / ω1(0) )^2 + ( Δω0(t) / Δω0(-∞) )^2  )
+			1 = ( ω1(t) / ω1(0) )^2 + ( Δω0(t) / Δω0(-∞) )^2
 
 			Solve, setting -μβ = Δω0(t0)
 			Δω0(t)	= -μβ * sqrt(1 - ( ω1(t) / ω1(0) )^2 )
@@ -229,7 +239,7 @@ module MRIPulse
 				* μ
 			)
 		=#
-		# Compute more convenient widht parameter
+		# Compute more convenient width parameter
 		β = 2 / width * @log_2_sqrt_3
 
 		# Construct pulse and compute adiabaticity
@@ -251,6 +261,16 @@ module MRIPulse
 		end
 
 		return pulse, K
+	end
+
+	function adiabatic_phase(ω1::AbstractArray{<: Real}, Δω0_max::Real, dt::Real)
+		# Actually, the ellipse equation doesnt have to be fullfilled, I guess it's just easier to check
+		# the adibaticity of the effective B-field goes along sth like a circle
+		# An adiabatic pulse can be anything, as long as the adibaticity is large enough
+		# ω1 must be positive
+		Δω0 = Δω0_max .* sqrt.(1 .- (ω1 ./ maximum(ω1)).^2)
+		ϕ = cumsum(Δω0) .* dt
+		return ϕ
 	end
 
 	function adiabaticity(ω1::AbstractVector{<: Real}, Δω0::AbstractVector{<: Real})::Real
