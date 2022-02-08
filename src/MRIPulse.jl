@@ -10,7 +10,7 @@ module MRIPulse
 	export gaussian, sinc
 	export index_axis, time_axis, frequency_axis, frequency_unit
 	export frequency_shift, frequency_shift!
-	export rfspoiling
+	export increment_rfspoiling
 	export adiabatic_hyperbolic_secant
 	export multi_band_pulse, multi_band_pulse!
 	export power_integral, peak_power, amplitude_integral
@@ -139,11 +139,29 @@ module MRIPulse
 	end
 
 	# RF spoiling
-	function rfspoiling(num::Integer, ϕ0::Real)::Vector{Float64}
-		n = 1:num
-		ϕ = @. (0.5 * ϕ0) * ( (n - 1) * (n - 2) )
-		# Note: At some point it makes sense to compute this differently,
-		# since floating point precision decreases.
+	function increment_rfspoiling(ϕ::Real, δϕ::Real, n::Integer)::Real
+		# ϕₙ = 1/2 δϕ ⋅ (n+1) ⋅ n
+		for i = 1:n
+			ϕ = mod2pi(ϕ + δϕ)
+		end
+		return ϕ
+		# Not the fastest and exactest for the usual case, but this computation is correct for large n
+		#= Note
+			Say it's a 3D sequence with matrix 256³, and a δϕ = 2π,
+			then the increment for the final pulse is approximately log₂((256³)² ⋅ 2π) ≈ 50.
+			So it just fits into a double (mantissa 11 bits), but why risk it?
+		=#
+	end
+
+	function rfspoiling(num::Integer, δϕ::Real)
+		ϕ = Vector{Float64}(undef, num)
+		@inbounds begin
+			ϕ[1] = 0.0
+			for i in 2:length(ϕ)
+				ϕ[i] = increment_rfspoiling(ϕ[i-1], δϕ, i)
+			end
+		end
+		return ϕ
 	end
 	
 	# Adiabatic pulses
