@@ -4,6 +4,11 @@ module MRIPulse
 		Units philosophy: Use indices in time and frequency domain.
 		There are functions to compute the actual units/axes, but use those only
 		for verification or plotting.
+
+		Note: It is debatable if it is better to have complex valued pulses or a pulse struct with r and ϕ.
+		The former is better for working with off resonance (adding bands) or faster for simulation
+		(real and imaginary define rotation axis, no need to compute (co)sine of phase).
+		Having a struct is easier for all technical stuff, plotting, defining the pulse for the scanner, etc.
 	=#
 
 	export parallelise, view, normalise!
@@ -15,9 +20,12 @@ module MRIPulse
 	export multi_band_pulse, multi_band_pulse!
 	export power_integral, peak_power, amplitude_integral
 	export minimise_peak_power, grid_evaluate_peak_power # Check with Samy's code (Bioeng KCL)
+	# TODO: consolidate these exports
 
 	import Base: @view, sinc
 	import Random
+	import QuadGK
+	import FiniteDifferences
 	import Optim
 	using LinearAlgebra
 
@@ -55,13 +63,22 @@ module MRIPulse
 
 
 	# Pulse shapes
-	@inline function gaussian(t::Real, width::Real)::Real # TODO: document what the actual width is
+	@inline function gaussian(t::Real, width::Real)::Real
+		# TODO: document what the actual width is
 		exp(-(0.5 / width^2) * t^2)
 	end
 
 	@inline function sinc(t::Real, width::Real)::Real
 		sinc((0.5 / width) * t)
 	end
+
+	@inline function hyperbolic_secant(t::Real, β::Real)
+		sech(β * t)
+	end
+	@inline function hyperbolic_secant_n(n::Integer, t::Real, β::Real)
+		sech((β * t)^n)
+	end
+
 
 	@inline function rectangular(samples::Integer)::Vector{Float64}
 		# Convenience for creating a rectangular pulse that is not breaking the normalise! function
@@ -112,7 +129,7 @@ module MRIPulse
 	# Small tip angle approximation
 	function amplitude_integral(pulse::AbstractVector{T})::Tuple{real(T), 2} where T <: Number
 		amplitude_integral = sum(pulse)
-		return abs(amplitude_integral), angle(amplitude_integral) 
+		return abs(amplitude_integral), angle(amplitude_integral)
 	end
 
 
@@ -165,142 +182,273 @@ module MRIPulse
 	end
 	
 	# Adiabatic pulses
-	macro log_2_sqrt_3()
-		log(2 + sqrt(3))
+	#=
+		TODO: remove t from args, rather set pulse length T and number samples
+		ω1(t) = ω1(0) * sech(βt)
+		Δω0(t) = γB0 - Ω1
+		where Ω1 is the frequency of the B1 field
+		Explain effective field
+
+		Bogus
+		Satisfy ellipsoid equation, radii are maximum amplitudes
+		1 = ( ω1(t) / ω1(0) )^2 + ( Δω0(t) / Δω0(-∞) )^2
+		Note: This is not necessary to be adiabatic, but makes it easier to ensure, since there is a
+		smooth transition of the effective field in the pulse's frame
+		Note: This is wrong, it actually holds
+		d/dt Δω0(t) ∝ ω1^2(t)
+		See Tannus1997, no naive explanation given
+
+		Wrong cont'd
+		Solve, setting -μβ = Δω0(t0)
+		Δω0(t)	= -μβ * sqrt(1 - ( ω1(t) / ω1(0) )^2 )
+				= -μβ * sqrt(1 - sech^2(βt))
+				= -μβ * sqrt( (cosh^2(βt) - 1) / cosh^2(βt) )
+				= -μβ * sqrt( sinh^2(βt) / cosh^2(βt) )
+				= -μβ * tanh(βt) # Silently ignoring the ±
+
+		The phase is then given by
+		ϕ(t)	= ∫ -Δω0(t') dt' from a given t0 to t
+				= μβ * ∫ tanh(βt') dt' from t0 to t
+				= μ * ∫ tanh(τ) dτ' from βt0 to βt, using τ = βt'
+				= μ * log(cosh(τ)) evaluated at βt0 and βt
+				= μ * ( log(cosh(βt)) - log(cosh(βt0)) )
+				= μ * log(cosh(βt) / cosh(βt0))
+
+		Full width half maximum of the ω1(t) curve
+
+		1/2 = 1 / cosh(βt)
+		2 = cosh(βt)
+		4 = exp(βt) + exp(-βt)
+		exp^2(βt) + 1 - 4 exp(βt) = 0
+		exp(βt) = (
+			4 ± sqrt(16 - 4 * 1 * 1)
+			/ 2
+		)
+		= 2 ± sqrt(3)
+
+		=> t = 1/β * log(2 ± sqrt(3))
+		=> width = 2/β * log(2 + sqrt(3))
+		=> β = 2/width * log(2 + sqrt(3))
+
+		Note that lim_{t → ∞} sech(βt) = 2*exp(-βt) can be used to determine a suitable width
+
+		Adiabaticity
+
+		K = |γB_eff / dα/dt|
+		= (
+			sqrt( ω1^2 * sech^2(βt) + (μβ)^2 * tanh^2(βt))
+			/ d/dt arctan(
+				ω1 * sech(βt)
+				/ (μβ * tanh(βt))
+			)
+		)
+		= (
+			sqrt( ω1^2 + (μβ)^2 * sinh^2(βt)) / cosh(βt)
+			/ d/dt arctan(
+				ω1
+				/ (μβ * sinh(βt))
+			)
+		)
+		= (
+			sqrt( ω1^2 + (μβ)^2 * sinh^2(βt)) / cosh(βt)
+			*
+			(1 + (ω1 / μβ)^2 csch^2(βt))
+			/
+			(ω1 / μ * cosh(βt)/sinh^2(βt))
+		)
+		= (
+			sqrt( ω1^2 + (μβ)^2 * sinh^2(βt))
+			*
+			(tanh^2(βt) + (ω1 / μβ)^2 sech^2(βt))
+			/
+			(ω1 / μ)
+		)
+		= (
+			sqrt(1 + (μβ / ω1)^2 * sinh^2(βt))
+			*
+			(tanh^2(βt) + (ω1 / μβ)^2 sech^2(βt))
+			* μ
+		)
+	=#
+	macro nth_sqrt_log_2_sqrt_3(n)
+		log_2_sqrt_3 = log(2 + sqrt(3))
+		return esc(:($log_2_sqrt_3^(1 / $n)))
 	end
-	function adiabatic_hyperbolic_secant(
+
+
+	function hyperbolic_secant_t0(β::Real, tolerance::Real)
+		x = 1 / tolerance
+		return log(x + sqrt(x^2 - 1)) / β
+	end
+	function hyperbolic_secant_n_approx_t0(n::Integer, β::Real, tolerance::Real)
+		# lim_{t -> ∞} sech((βt)^n) = lim_{t -> ∞} 2 exp(-(βt)^n)
+		return (-log(0.5 * tolerance))^(1/n) / β
+	end
+
+	function hyperbolic_secant(
 		t::AbstractVector{<: Real},
 		ω1::Real,
-		width::Real,
+		β::Real,
 		μ::Real
-	)::Tuple{Vector{<: Complex}, Vector{<: Real}}
-		#=
-			TODO: remove t from args, rather set pulse length T and number samples
-			ω1(t) = ω1(0) * sech(βt)
-			Δω0(t) = γB0 - Ω1
-			where Ω1 is the frequency of the B1 field
-			Explain effective field
-
-			Satisfy ellipsoid equation, radii are maximum amplitudes
-			1 = ( ω1(t) / ω1(0) )^2 + ( Δω0(t) / Δω0(-∞) )^2
-
-			Solve, setting -μβ = Δω0(t0)
-			Δω0(t)	= -μβ * sqrt(1 - ( ω1(t) / ω1(0) )^2 )
-					= -μβ * sqrt(1 - sech^2(βt))
-					= -μβ * sqrt( (cosh^2(βt) - 1) / cosh^2(βt) )
-					= -μβ * sqrt( sinh^2(βt) / cosh^2(βt) )
-					= -μβ * tanh(βt) # Silently ignoring the ±
-
-			The phase is then given by
-			ϕ(t)	= ∫ Δω0(t') dt' from a given t0 to t
-					= -μβ * ∫ tanh(βt') dt' from t0 to t
-					= -μ * ∫ tanh(τ) dτ' from βt0 to βt, using τ = βt'
-					= -μ * log(cosh(τ)) evaluated at βt0 and βt
-					= -μ * ( log(cosh(βt)) - log(cosh(βt0)) )
-					= -μ * log(cosh(βt) / cosh(βt0))
-
-
-			Full width half maximum of the ω1(t) curve
-
-			1/2 = 1 / cosh(βt)
-			2 = cosh(βt)
-			4 = exp(βt) + exp(-βt)
-			exp^2(βt) + 1 - 4 exp(βt) = 0
-			exp(βt) = (
-				4 ± sqrt(16 - 4 * 1 * 1)
-				/ 2
-			)
-			= 2 ± sqrt(3)
-
-			=> t = 1/β * log(2 ± sqrt(3))
-			=> width = 2/β * log(2 + sqrt(3))
-			=> β = 2/width * log(2 + sqrt(3))
-
-			Note that lim_{t → ∞} sech(βt) = 2*exp(-βt) can be used to determine a suitable width
-
-
-			Adiabaticity
-
-			K = |γB_eff / dα/dt|
-			= (
-				sqrt( ω1^2 * sech^2(βt) + (μβ)^2 * tanh^2(βt))
-				/ d/dt arctan(
-					ω1 * sech(βt)
-					/ (μβ * tanh(βt))
-				)
-			)
-			= (
-				sqrt( ω1^2 + (μβ)^2 * sinh^2(βt)) / cosh(βt)
-				/ d/dt arctan(
-					ω1
-					/ (μβ * sinh(βt))
-				)
-			)
-			= (
-				sqrt( ω1^2 + (μβ)^2 * sinh^2(βt)) / cosh(βt)
-				*
-				(1 + (ω1 / μβ)^2 csch^2(βt)) 
-				/
-				(ω1 / μ * cosh(βt)/sinh^2(βt))
-			)
-			= (
-				sqrt( ω1^2 + (μβ)^2 * sinh^2(βt))
-				*
-				(tanh^2(βt) + (ω1 / μβ)^2 sech^2(βt)) 
-				/
-				(ω1 / μ)
-			)
-			= (
-				sqrt(1 + (μβ / ω1)^2 * sinh^2(βt))
-				*
-				(tanh^2(βt) + (ω1 / μβ)^2 sech^2(βt)) 
-				* μ
-			)
-		=#
-		# Compute more convenient width parameter
-		β = 2 / width * @log_2_sqrt_3
-
+	)::Tuple{Vector{ComplexF64}, Vector{Float64}, Vector{Float64}}
+		
 		# Construct pulse and compute adiabaticity
 		pulse = Vector{ComplexF64}(undef, length(t));
+		Δω0 = Vector{Float64}(undef, length(t));
 		K = Vector{Float64}(undef, length(t));
-		let cosh_βt = cosh.(β * t)
+		let cosh_βt = cosh.(β * t), tanh_βt = tanh.(β * t)
 
-			# Pulse
+			# Pulse and off-resonance
 			sech_βt = 1 ./ cosh_βt
-			@. pulse = ω1 * sech_βt * exp(-im * μ * log(cosh_βt / cosh(β * t[1])))
+			@. pulse = ω1 * sech_βt * exp(im * μ * log(cosh_βt / cosh(β * t[1])))
+			@. Δω0 = -μ * β * tanh_βt
 
 			# Adiabaticity
-			let η = (μ * β / ω1)^2, tanh_βt = tanh.(β * t)
+			let η = (μ * β / ω1)^2
 				@. K = (
 					μ * sqrt(1 + η * (cosh_βt^2 - 1))
-					* (tanh_βt^2 + 1/η * sech_βt^2) 
+					* (tanh_βt^2 + sech_βt^2 / η)
 				)
 			end
 		end
 
-		return pulse, K
+		return pulse, Δω0, K
+	end
+	function hyperbolic_secant(
+		amplitude::Real,
+		width::Real,
+		bandwidth::Real,
+		t0::Real,
+		dt::Real
+	)::Tuple{Vector{ComplexF64}, Vector{Float64}, Vector{Float64}, Vector{Float64}}
+
+		# Compute more convenient parameters
+		β = 2 / width * @nth_sqrt_log_2_sqrt_3(1)
+		μ = bandwidth / 2β
+
+		# Compute time axis
+		t = range(-t0, t0; length=round(Int, 2t0/dt))
+
+		# Compute pulse and adiabaticity
+		pulse, Δω0, K = hyperbolic_secant(t, amplitude, β, μ)
+		return (pulse, Δω0, K, t)
 	end
 
-	function adiabatic_phase(ω1::AbstractArray{<: Real}, Δω0_max::Real, dt::Real)
-		# Actually, the ellipse equation doesnt have to be fullfilled, I guess it's just easier to check
-		# the adibaticity of the effective B-field goes along sth like a circle
-		# An adiabatic pulse can be anything, as long as the adibaticity is large enough
-		# ω1 must be positive
-		Δω0 = Δω0_max .* sqrt.(1 .- (ω1 ./ maximum(ω1)).^2)
-		ϕ = cumsum(Δω0) .* dt
-		return ϕ
+	"""
+		Δω0 ∝ ∫[-∞, t] ω1^2(t') dt' - ∫[-∞, 0] ω1^2(t') dt' = ∫[0, t] ω1^2(t') dt'
+
+		lim_{t -> ∞} sech((βt)^n) = lim_{t -> ∞} exp(-(βt)^n)
+		
+	"""
+	function hyperbolic_secant_n(
+		n::Integer,
+		t::AbstractVector{<: Real},
+		ω1::Real,
+		β::Real,
+		μ::Real
+	)
+		# Compute off-resonance, phase and adiabaticity
+		Δω0 = Vector{Float64}(undef, length(t));
+		ϕ = Vector{Float64}(undef, length(t));
+		K = Vector{Float64}(undef, length(t));
+		# TODO: Big time inefficient, but pretty exact, required?
+		let
+			integrand(t) = hyperbolic_secant_n(n, t, β)^2
+			compute_Δω0(t) = QuadGK.quadgk(integrand, 0, t)[1] # Basically scaled Δω0
+			compute_hyperbolic_secant(t) = hyperbolic_secant_n(n, t, β)
+			# Prefactor is to get actual bandwidth, in order to be compatible with the n=1 case
+			prefactor = -μ * β / QuadGK.quadgk(
+				integrand,
+				0, Inf
+			)[1]
+			derivative = FiniteDifferences.central_fdm(5, 1)
+			# Compute Δω0 and pulse phase ϕ by integrating
+			for i = 1:length(t)
+				Δω0[i] = prefactor * QuadGK.quadgk(integrand, 0, t[i])[1]
+				ϕ[i] = prefactor * QuadGK.quadgk(compute_Δω0, 0, t[i])[1]
+				#= Calculate (' ≡ d/dt):
+					α = atan(ω1 / Δω0)
+					dα/dt = (Δω0⋅ω1' - ω1⋅Δω0') / (Δω0^2 + ω1^2)
+					K = |γB_eff| / |dα/dt| = √(ω1^2 + Δω0^2) * (Δω0^2 + ω1^2) / (Δω0⋅ω1' - ω1⋅Δω0')
+					  = (ω1^2 + Δω0^2)^(3/2) / (Δω0⋅ω1' - ω1⋅Δω0')
+				=#
+				ω1_at_t = ω1 * hyperbolic_secant_n(n, t[i], β)
+				Δω0_at_t = prefactor * compute_Δω0(t[i])
+				K[i] = (
+					(ω1_at_t^2 + Δω0_at_t^2)^(1.5)
+					/ abs(
+						Δω0_at_t * ω1 * derivative(compute_hyperbolic_secant, t[i])
+						- ω1_at_t * derivative(compute_Δω0, t[i])
+					)
+				)
+			end
+		end
+
+		# Pulse
+		pulse = Vector{ComplexF64}(undef, length(t));
+		@. pulse = ω1 * hyperbolic_secant_n(n, t, β) * exp(-im * ϕ)
+		# Old version for getting pulse phase, more efficient, but less accurate
+		#let
+		#	# Compute phase in units rad / dt
+		#	dt = Float64(t.step)
+		#	cumsum!(pulse, Δω0) # Misuse variable
+		#	@. pulse = ω1 * hyperbolic_secant_n(n, t, β) * exp(-(im * dt) * pulse)
+		#end
+
+		return pulse, Δω0, K
 	end
 
-	function adiabaticity(ω1::AbstractVector{<: Real}, Δω0::AbstractVector{<: Real})::Real
-		# ω1 = amplitude of B1, Δω0 = offset of B1 rotation to Larmor
-		# In units of dt
-		tmp = 0
+	"""
+		Full width half maximum of the ω1(t) curve
+
+		1/2 = 1 / cosh((βt)^n)
+		2 = cosh((βt)^n)
+		4 = exp((βt)^n) + exp(-(βt)^n)
+
+		4 = exp((βt)^n) + exp(-(βt)^n)
+		exp^2((βt)^n) + 1 - 4 exp((βt)^n) = 0
+		exp((βt)^n) = (
+			(4 ± sqrt(16 - 4 * 1 * 1))
+			/ 2
+		)
+		= 2 ± sqrt(3)
+		Note: Choose positive side
+
+		=> t = 1/β * ⁿ√log(2 + sqrt(3))
+		=> width = 2/β * ⁿ√log(2 + sqrt(3))
+		=> β = 2/width * ⁿ√log(2 + sqrt(3))
+	"""
+	function hyperbolic_secant_n(
+		n::Integer,
+		amplitude::Real,
+		width::Real,
+		bandwidth::Real,
+		t0::Real,
+		dt::Real
+	)::Tuple{Vector{ComplexF64}, Vector{Float64}, Vector{Float64}, Vector{Float64}}
+
+		# Compute more convenient parameters
+		β = 2 / width * @nth_sqrt_log_2_sqrt_3(n)
+		μ = bandwidth / 2β # Derived from the n = 1 case
+
+		# Compute time axis
+		t = range(-t0, t0; length=round(Int, 2t0/dt))
+
+		# Compute pulse and adiabaticity
+		pulse, Δω0, K = hyperbolic_secant_n(n, t, amplitude, β, μ)
+		return (pulse, Δω0, K, t)
+	end
+
+	function adiabaticity(ω1::AbstractVector{<: Real}, Δω0::AbstractVector{<: Real}, dt::Real)::Float64
+		# Compute derivative of α, i.e. how fast the effective magnetic field
+		# (in the frame rotating with the pulse) goes aligned to anti-aligned
+		error("Not Implemented")
 		dα_dt = Vector{Float64}(undef, length(ω1))
 		for t = 1:length(ω1)
-			dα_dt[t] = arctan(ω1[t] / Δω0[t]) - tmp
-			tmp = dα_dt[t]
+			1 / (Δω0[t]^2 + ω1[t]^2) * (Δω0[t] * ω1'[t] - ω1[t] * Δω0'[t])
 		end
-		A = @. sqrt(ω1^2 + Δω0^2) / abs.(dα_dt)
+		# In units of dt
+		return @. sqrt(ω1^2 + Δω0^2) / abs(dα_dt)
 	end
 
 	# Multi band pulses
@@ -413,7 +561,7 @@ module MRIPulse
 				# Initial phase in (0, 2π) elementwise
 				@. ϕ0 = π * (
 					$rand(rng[Threads.threadid()], 2)
-					- $rand(rng[Threads.threadid()], 2) + 1.0 
+					- $rand(rng[Threads.threadid()], 2) + 1.0
 				)
 				# Run optimisation
 				solution = Optim.optimize(
