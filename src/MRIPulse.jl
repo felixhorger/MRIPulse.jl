@@ -622,5 +622,7 @@ module MRIPulse
 		return max_power
 	end
 
+	ernst_angle(TR::Real, T1::Real) = acos(exp(-TR/T1))
+
 end
 
