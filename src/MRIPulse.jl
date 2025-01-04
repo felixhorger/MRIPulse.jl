@@ -53,7 +53,7 @@ module MRIPulse
 		esc(
 			quote
 				if threading
-					@Threads.threads $forloop
+					@Threads.threads :static $forloop
 				else
 					$forloop
 				end
